@@ -1,0 +1,25 @@
+pkgbase = linksmine
+	pkgdesc = CLI setup wizard for Limine boot-entry restart shortcuts
+	pkgver = 1.0.0rc.1
+	pkgrel = 1
+	url = https://github.com/naXa777/linksmine
+	arch = x86_64
+	license = MIT
+	makedepends = make
+	depends = python
+	depends = sudo
+	depends = systemd
+	depends = e2fsprogs
+	depends = kdialog
+	source = linksmine
+	source = README.md
+	source = LICENSE
+	source = Makefile
+	source = test_core.py
+	sha256sums = 67dc8880e53db0b7abb1797b73d8895bf3b91f98d45380ee8bdcd913af3052d5
+	sha256sums = fc3f498fc79e69de7156b14ee55bf01e79ce7e7d3de28d0a93055091df605e0b
+	sha256sums = 4a5a3741555043ac7298b3bbcb3083f5bbd01dc5897310737ec6d5fce5485893
+	sha256sums = 241b83ee155915ad77edb34223844371c0870c9270e4c73f084f5d1457381a09
+	sha256sums = 34cb6554f6f98fd66f3083b227bdf8c114382f0fd725f4373d1cf64a84b07d60
+
+pkgname = linksmine

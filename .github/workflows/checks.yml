@@ -1,0 +1,31 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+      - run: make test
+      - run: bash -n PKGBUILD packaging/aur/linksmine-git/PKGBUILD
+      - run: make DESTDIR="$RUNNER_TEMP/linksmine-install" install
+  package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm git python sudo systemd e2fsprogs kdialog
+      - uses: actions/checkout@v7
+      - name: Build pacman package
+        run: |
+          useradd -m builder
+          cp -a "$GITHUB_WORKSPACE" /tmp/linksmine-build
+          chown -R builder:builder /tmp/linksmine-build
+          cd /tmp/linksmine-build
+          runuser -u builder -- bash -c 'makepkg --printsrcinfo | diff -u .SRCINFO -'
+          runuser -u builder -- makepkg --cleanbuild --force --noconfirm

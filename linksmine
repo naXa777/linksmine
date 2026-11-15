@@ -1,0 +1,785 @@
+#!/usr/bin/python3 -I
+"""Linksmine — Boot entries, one click away."""
+import argparse
+import collections
+import contextlib
+import ctypes
+import curses
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import readline
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import uuid
+
+VERSION = '1.0.0'
+APP = '/usr/bin/linksmine'
+EFIVARS = Path('/sys/firmware/efi/efivars')
+CONFIG_DIR = Path('/etc/linksmine.d')
+PREFIX = 'LimineLastBootedEntry-'
+VARIABLE_RE = re.compile(r'LimineLastBootedEntry-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+ID_RE = re.compile(r'[0-9a-f]{32}')
+PROTOCOLS = {'linux', 'limine', 'multiboot', 'multiboot1', 'multiboot2', 'efi',
+             'uefi', 'efi_chainload', 'efi_boot_entry'}
+SAFE_ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+KNOWN_NAMESPACES = {
+    '03884334-1756-4978-9c8c-86fb8998b4ea': {
+        'label': 'Recognized Limine namespace v12.x',
+        'format_label': 'entry-path format',
+    },
+    '513ee0d0-6e43-cb05-b272-f146a2fcb88a': {
+        'label': 'Historical Limine namespace',
+        'format_label': 'entry-path value detected',
+    },
+}
+VARIABLE_EXPLANATION = (
+    'These settings may remain after bootloader upgrades.',
+    'Choosing an inactive setting will not change Limine’s default entry.',
+    'Only the selected setting will be modified.',
+)
+
+
+def checked_text(value, name='Text', limit=1024):
+    if not isinstance(value, str) or not value.strip() or len(value.encode('utf-8')) > limit:
+        raise ValueError(f'{name} must be nonempty and at most {limit} UTF-8 bytes.')
+    if any(unicodedata.category(c).startswith('C') for c in value):
+        raise ValueError(f'{name} contains a control or formatting character.')
+    return value
+
+
+def escape_segment(name):
+    return name.replace('\\', '\\\\').replace('/', '\\/').replace('#', '\\#')
+
+
+def is_snapshot_group(node):
+    if not node['directory']:
+        return False
+    title = node['title'].strip().casefold()
+    return (
+            title in {'snapshots', '.snapshots'}
+            or re.fullmatch(r'snapshots\s+\([^)]*\)', title) is not None
+    )
+
+
+def parse_menu(text):
+    """Parse literal entry titles and return eligible leaves with canonical paths."""
+    nodes, stack, counts, globals_ = [], [], collections.Counter(), {}
+    current = None
+    for lineno, original in enumerate(text.splitlines(), 1):
+        line = original.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('/'):
+            match = re.fullmatch(r'(/+)(\+?)(.+)', line)
+            if not match:
+                raise ValueError(f'Invalid menu header on line {lineno}.')
+            depth, title = len(match[1]), match[3]
+            if depth > len(stack) + 1:
+                raise ValueError(f'Menu hierarchy skips a level on line {lineno}.')
+            checked_text(title, 'Entry title')
+            if '${' in title:
+                raise ValueError('Macro-expanded entry titles are not supported. Use literal menu titles.')
+            parent = stack[:depth - 1]
+            key = (parent[-1]['path'] if parent else '', title)
+            occurrence = counts[key]
+            counts[key] += 1
+            segment = escape_segment(title) + (f'#{occurrence}' if occurrence else '')
+            path = '/'.join([n['segment'] for n in parent] + [segment])
+            current = {'title': title, 'path': path, 'segment': segment, 'options': {},
+                       'directory': False, 'parent': parent[-1] if parent else None}
+            if parent:
+                parent[-1]['directory'] = True
+            stack = parent + [current]
+            nodes.append(current)
+        elif ':' in line:
+            key, value = line.split(':', 1)
+            target = globals_ if current is None else current['options']
+            target.setdefault(key.strip().lower(), []).append(value.strip())
+        elif line.startswith('${'):
+            continue
+        else:
+            raise ValueError(f'Unrecognized configuration syntax on line {lineno}.')
+    remember = globals_.get('remember_last_entry', [])
+    if not remember or any(value != 'yes' for value in remember):
+        raise ValueError('Enable remember_last_entry: yes before the first menu entry in your Limine configuration.')
+    def eligible(node):
+        while node:
+            if is_snapshot_group(node):
+                return False
+            opts = node['options']
+            if any(v != 'UEFI' for v in opts.get('if_fw_type', [])):
+                return False
+            for key in ('if_arch', 'if_loader_arch'):
+                if any('x86-64' not in v.split() for v in opts.get(key, [])):
+                    return False
+            node = node['parent']
+        return True
+    result = []
+    for node in nodes:
+        protocols = node['options'].get('protocol', [])
+        if (not node['directory'] and len(protocols) == 1 and
+                protocols[0] in PROTOCOLS and eligible(node)):
+            result.append({'title': node['title'], 'path': node['path']})
+    if not result:
+        raise ValueError('No supported bootable entries found in this configuration.')
+    return result
+
+
+def decode(raw):
+    if len(raw) < 6 or len(raw) > 65536 or raw[:4] != struct.pack('<I', 7):
+        raise ValueError('Expected an existing string variable with EFI attributes 7.')
+    body = raw[4:]
+    if body[-1:] != b'\0' or b'\0' in body[:-1]:
+        raise ValueError('Expected a NUL-terminated UTF-8 remembered-entry path.')
+    return checked_text(body[:-1].decode('utf-8'), 'Remembered entry', 4096)
+
+
+def payload(raw, entry):
+    decode(raw)
+    checked_text(entry, 'Entry path', 4096)
+    return raw[:4] + entry.encode('utf-8') + b'\0'
+
+
+def valid_id(value):
+    if not ID_RE.fullmatch(value):
+        raise ValueError('Invalid shortcut identifier.')
+    return value
+
+
+def root_only():
+    if os.geteuid() != 0:
+        raise ValueError('Administrator authorization is required for this operation.')
+
+
+def trusted_path(path):
+    resolved = Path(path).resolve(strict=True)
+    for item in (resolved, *resolved.parents):
+        info = item.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError(f'Boot configuration and its directories must be root-owned and not group/world writable: {item}')
+    if not resolved.is_file():
+        raise ValueError('Configuration is not a regular file.')
+    return resolved
+
+
+def read_menu(path):
+    path = trusted_path(path)
+    if path.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError('Limine configuration exceeds the 8 MiB size limit.')
+    return parse_menu(path.read_text(encoding='utf-8'))
+
+
+def discover_configs():
+    def matching(base, parts):
+        if not parts:
+            return [base] if base.is_file() else []
+        if not base.is_dir():
+            return []
+        found = []
+        for child in base.iterdir():
+            if child.name.casefold() == parts[0].casefold():
+                found.extend(matching(child, parts[1:]))
+        return found
+    candidates = set()
+    for base in (Path('/boot'), Path('/efi'), Path('/boot/efi')):
+        for relative in ('limine.conf', 'limine/limine.conf', 'boot/limine.conf', 'boot/limine/limine.conf'):
+            candidates.update(str(p.resolve()) for p in matching(base, relative.split('/')))
+        if base.is_dir():
+            for efi in base.iterdir():
+                if efi.name.casefold() == 'efi' and efi.is_dir():
+                    for loader in efi.iterdir():
+                        if loader.is_dir():
+                            candidates.update(str(p.resolve()) for p in matching(loader, ['limine.conf']))
+    return sorted(candidates)
+
+
+@contextlib.contextmanager
+def open_variable(name, flags=os.O_RDONLY):
+    if not VARIABLE_RE.fullmatch(name):
+        raise ValueError('Invalid Limine variable name.')
+    fd = os.open(EFIVARS / name, flags | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        # Check the backing filesystem before any firmware read or write.
+        libc = ctypes.CDLL(None, use_errno=True)
+        buf = ctypes.create_string_buffer(256)
+        if libc.fstatfs(fd, ctypes.byref(buf)) != 0:
+            raise OSError(ctypes.get_errno(), 'Cannot inspect EFI filesystem')
+        if ctypes.c_long.from_buffer(buf).value & 0xffffffff != 0xde5e81e4:
+            raise ValueError('EFI variable is not on an efivarfs filesystem.')
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('EFI variable is not a regular file.')
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def read_variable(name):
+    with open_variable(name) as fd:
+        return os.read(fd, 65537)
+
+
+def discover_variables():
+    if not EFIVARS.is_dir():
+        raise ValueError('UEFI variables are unavailable. Boot Linux in UEFI mode with efivarfs mounted.')
+    result = []
+    for path in sorted(EFIVARS.glob(PREFIX + '*')):
+        if not VARIABLE_RE.fullmatch(path.name):
+            continue
+        try:
+            result.append({'name': path.name, 'current': decode(read_variable(path.name))})
+        except (OSError, ValueError, UnicodeError) as error:
+            result.append({'name': path.name, 'error': str(error)})
+    return result
+
+
+def namespace_info(name):
+    if not VARIABLE_RE.fullmatch(name):
+        raise ValueError('Invalid Limine variable name.')
+
+    guid = name[len(PREFIX):].lower()
+    return guid, KNOWN_NAMESPACES.get(guid)
+
+
+def describe_variable(item):
+    guid, info = namespace_info(item['name'])
+
+    if info is None:
+        description = 'Unknown namespace'
+    else:
+        description = (
+            f"{info['label']} · {info['format_label']}"
+        )
+
+    return (
+        f'{guid}\n'
+        f'    {description}\n'
+        f"    Currently remembers: {item['current']}"
+    )
+
+
+def require_supported_namespace(name):
+    _, info = namespace_info(name)
+
+    if info is None:
+        raise ValueError(
+            'This firmware variable uses an unknown namespace. '
+            'Linksmine will not modify it.'
+        )
+
+
+def inspect_system(explicit=None):
+    root_only()
+    candidates = [explicit] if explicit else discover_configs()
+    configs = []
+    for candidate in candidates:
+        try:
+            entries = read_menu(candidate)
+            configs.append({'path': str(trusted_path(candidate)), 'entries': entries})
+        except (OSError, ValueError, UnicodeError) as error:
+            configs.append({'path': str(candidate), 'error': str(error)})
+    return {'configs': configs, 'variables': discover_variables()}
+
+
+def command(args, capture=False):
+    return subprocess.run(args, check=True, env=SAFE_ENV,
+                          stdout=subprocess.PIPE if capture else None,
+                          text=True)
+
+
+def atomic_file(path, data, mode):
+    fd, temporary = tempfile.mkstemp(prefix='.linksmine-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            os.fchmod(out.fileno(), mode)
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def locked():
+    root_only()
+    fd = os.open('/run/linksmine.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, 'w') as out:
+        info = os.fstat(out.fileno())
+        if info.st_uid != 0 or not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+            raise ValueError('Unsafe lock file permissions.')
+        fcntl.flock(out, fcntl.LOCK_EX)
+        yield
+
+
+def config_path(identifier):
+    return CONFIG_DIR / (valid_id(identifier) + '.json')
+
+
+def load_config(identifier):
+    path = trusted_path(config_path(identifier))
+    data = json.loads(path.read_text())
+    if data.get('schema') != 1 or data.get('id') != identifier:
+        raise ValueError('Unsupported shortcut configuration. Run linksmine setup again.')
+    return data
+
+
+def authorize_config(data):
+    caller = os.environ.get('SUDO_UID')
+    if caller is not None and int(caller) != data['uid']:
+        raise ValueError('This shortcut belongs to another user.')
+
+
+def configure(args):
+    with locked():
+        account = pwd.getpwnam(args.user)
+        if account.pw_uid == 0 or not re.fullmatch(r'[a-z_][a-z0-9_-]*[$]?', account.pw_name):
+            raise ValueError('A supported non-root user account is required.')
+        identifier = valid_id(args.id)
+        label = checked_text(args.label.strip(), 'Shortcut name', 256)
+        menu = trusted_path(args.config)
+        if args.entry not in {e['path'] for e in read_menu(menu)}:
+            raise ValueError('The selected entry is no longer available.')
+        require_supported_namespace(args.variable)
+        payload(read_variable(args.variable), args.entry)
+        CONFIG_DIR.mkdir(mode=0o755, exist_ok=True)
+        directory = CONFIG_DIR.stat()
+        if CONFIG_DIR.is_symlink() or directory.st_uid != 0 or directory.st_mode & 0o022:
+            raise ValueError('Unsafe configuration directory.')
+        destination = config_path(identifier)
+        if destination.exists():
+            raise ValueError('Shortcut identifier already exists; run setup again.')
+        data = {'schema': 1, 'id': identifier, 'uid': account.pw_uid,
+                'user': account.pw_name, 'label': label, 'menu': str(menu),
+                'variable': args.variable, 'entry': args.entry}
+        rule_path = Path('/etc/sudoers.d') / ('linksmine-' + identifier)
+        rule = (f'{account.pw_name} ALL=(root) NOPASSWD: {APP} select {identifier}, '
+                f'{APP} status {identifier}\n')
+        fd, temporary = tempfile.mkstemp(prefix='.linksmine-', dir=rule_path.parent)
+        try:
+            with os.fdopen(fd, 'w') as out:
+                os.fchmod(out.fileno(), 0o440)
+                out.write(rule)
+            command(['/usr/bin/visudo', '-cf', temporary])
+            atomic_file(destination, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode(), 0o644)
+            try:
+                os.replace(temporary, rule_path)
+            except Exception:
+                destination.unlink()
+                raise
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    print('Configured shortcut. No firmware values changed.')
+
+
+def select(identifier):
+    with locked():
+        data = load_config(identifier)
+        authorize_config(data)
+        if data['entry'] not in {e['path'] for e in read_menu(data['menu'])}:
+            raise ValueError('The configured entry is unavailable. Run linksmine setup to create a new shortcut.')
+        require_supported_namespace(data['variable'])
+        raw = read_variable(data['variable'])
+        desired = payload(raw, data['entry'])
+        if raw != desired:
+            with open_variable(data['variable']) as fd:
+                # Linux x86_64 FS_IOC_GETFLAGS and FS_IMMUTABLE_FL.
+                flags = struct.unpack('I', fcntl.ioctl(fd, 0x80086601, bytes(4)))[0]
+            immutable = bool(flags & 0x10)
+            path = str(EFIVARS / data['variable'])
+            if immutable:
+                command(['/usr/bin/chattr', '-i', path])
+            try:
+                with open_variable(data['variable'], os.O_WRONLY) as fd:
+                    if os.write(fd, desired) != len(desired):
+                        raise OSError('Short firmware write; restart cancelled.')
+            finally:
+                if immutable:
+                    command(['/usr/bin/chattr', '+i', path])
+        if read_variable(data['variable']) != desired:
+            raise ValueError('Firmware verification failed; restart cancelled.')
+        print('Verified Limine selection:', data['entry'])
+
+
+def status(identifier):
+    root_only()
+    data = load_config(identifier)
+    authorize_config(data)
+    print('Shortcut:', data['label'])
+    print('Entry:', data['entry'])
+    print('Configuration:', data['menu'])
+    print('EFI variable:', data['variable'])
+    print('Current selection:', decode(read_variable(data['variable'])))
+
+
+def desktop_escape(value):
+    return value.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+
+
+def desktop_text(label, identifier):
+    checked_text(label, 'Shortcut name', 256)
+    valid_id(identifier)
+    return ('[Desktop Entry]\nType=Application\nVersion=1.0\n'
+            f'Name={desktop_escape(label)}\n'
+            'Comment=Select a Limine boot entry and reboot\n'
+            f'Exec={APP} reboot {identifier}\n'
+            'Icon=system-reboot\nTerminal=false\nStartupNotify=false\nCategories=System;\n')
+
+
+def user_shortcuts():
+    result = []
+    if CONFIG_DIR.is_dir():
+        for path in sorted(CONFIG_DIR.glob('*.json')):
+            try:
+                data = load_config(path.stem)
+                if data['uid'] == os.getuid():
+                    result.append(data)
+            except (OSError, ValueError, KeyError):
+                continue
+    return result
+
+
+def choose(title, items, display, footer=()):
+    if not items:
+        raise ValueError('Nothing available to select.')
+
+    blocks = [display(item).splitlines() for item in items]
+
+    def print_block(index, selected=False):
+        lines = blocks[index]
+        prefix = '  > ' if selected else f'  {index + 1}. '
+        print(prefix + lines[0])
+
+        for detail in lines[1:]:
+            print('    ' + detail)
+
+    print('\n' + title)
+
+    if len(items) == 1:
+        print_block(0, selected=True)
+
+        if footer:
+            print()
+            print('\n'.join(footer))
+
+        return items[0]
+
+    use_curses = (
+            sys.stdin.isatty()
+            and sys.stdout.isatty()
+            and os.environ.get('TERM', '') not in ('', 'dumb')
+    )
+
+    if use_curses:
+        def picker(screen):
+            index = 0
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            screen.keypad(True)
+            while True:
+                height, width = screen.getmaxyx()
+                block_height = max(len(block) for block in blocks) + 1
+
+                # Header, title, footer, controls, and spacing.
+                reserved = 7 + len(footer)
+                available = height - reserved
+
+                if width < 40 or available < block_height:
+                    raise curses.error('Terminal too small for this menu.')
+
+                visible = max(1, available // block_height)
+                start = max(0, index - visible + 1)
+
+                screen.erase()
+
+                def line(row, text, mode=0):
+                    if 0 <= row < height - 1:
+                        try:
+                            screen.addnstr(
+                                row, 0, text, width - 2, mode
+                            )
+                        except curses.error:
+                            pass
+                line(0, 'Linksmine — Boot entries, one click away.')
+                line(2, title)
+
+                row = 4
+
+                for position in range(
+                        start, min(len(items), start + visible)
+                ):
+                    selected = position == index
+                    block = blocks[position]
+
+                    line(
+                        row,
+                        ('  > ' if selected else '    ') + block[0],
+                        curses.A_REVERSE if selected else 0,
+                        )
+
+                    for offset, detail in enumerate(block[1:], 1):
+                        line(row + offset, '    ' + detail)
+
+                    row += block_height
+
+                footer_start = height - len(footer) - 3
+
+                for offset, text in enumerate(footer):
+                    line(footer_start + offset, text)
+
+                line(
+                    height - 2,
+                    'Up/Down: select   Enter: confirm   Esc/q: cancel',
+                    )
+
+                screen.refresh()
+                key = screen.getch()
+                if key in (curses.KEY_UP, ord('k')):
+                    index = (index - 1) % len(items)
+                elif key in (curses.KEY_DOWN, ord('j')):
+                    index = (index + 1) % len(items)
+                elif key in (10, 13, curses.KEY_ENTER):
+                    return items[index]
+                elif key in (27, ord('q')):
+                    raise KeyboardInterrupt
+        try:
+            selected = curses.wrapper(picker)
+
+            # Preserve the chosen item's explanation in terminal history.
+            print_block(items.index(selected), selected=True)
+
+            if footer:
+                print()
+                print('\n'.join(footer))
+
+            return selected
+        except curses.error:
+            # Fall back to a numbered menu on small or limited terminals.
+            pass
+
+    for index in range(len(items)):
+        print_block(index)
+        print()
+
+    if footer:
+        print('\n'.join(footer))
+        print()
+
+    while True:
+        try:
+            value = int(input('Select a number: '))
+            if 1 <= value <= len(items):
+                return items[value - 1]
+        except ValueError:
+            pass
+        print('Enter one of the listed numbers.')
+
+
+def edit_label(default):
+    while True:
+        readline.set_startup_hook(lambda: readline.insert_text(default))
+        try:
+            value = input('\nApplication-menu shortcut name:\n> ').strip()
+        finally:
+            readline.set_startup_hook()
+        try:
+            return checked_text(value, 'Shortcut name', 256)
+        except ValueError as error:
+            print(error)
+
+
+def require_kde():
+    desktops = os.environ.get('XDG_CURRENT_DESKTOP', '').upper().split(':')
+    if 'KDE' not in desktops:
+        raise ValueError('Restart integration currently supports KDE Plasma. Run this command in your KDE session.')
+
+
+def setup(explicit=None):
+    if os.geteuid() == 0:
+        raise ValueError('Run linksmine as your normal desktop user, not with sudo.')
+    if not sys.stdin.isatty():
+        raise ValueError('Run setup in an interactive terminal.')
+    require_kde()
+    if not Path(APP).is_file():
+        raise ValueError('Install Linksmine before running setup (makepkg -si).')
+    print(__doc__)
+    print('\nAdministrator authorization is needed to inspect boot settings and configure the shortcut.')
+    args = ['/usr/bin/sudo', APP, 'inspect']
+    if explicit:
+        args += ['--config', explicit]
+    report = json.loads(command(args, capture=True).stdout)
+    configs = [c for c in report['configs'] if 'entries' in c]
+    for item in report['configs']:
+        if 'error' in item:
+            print(f"Skipped {item['path']}: {item['error']}")
+    if not configs:
+        raise ValueError('No usable configuration found. Use linksmine setup --config /path/to/limine.conf.')
+    menu = choose('Limine configuration:', configs, lambda c: c['path'])
+    entry = choose('Select a Limine entry:', menu['entries'], lambda e: e['path'])
+    variables = []
+    for item in report['variables']:
+        if 'error' in item:
+            print(f"Skipped {item['name']}: {item['error']}")
+            continue
+
+        guid, info = namespace_info(item['name'])
+
+        if info is None:
+            print(
+                f'Unavailable firmware setting: {guid} '
+                '(unknown namespace; will not be modified)'
+            )
+            continue
+
+        variables.append(item)
+
+    if not variables:
+        raise ValueError(
+            'No recognized Limine remembered-entry variable with a '
+            'supported entry-path value was found. Boot an entry through '
+            'Limine with remember_last_entry enabled, then retry.'
+        )
+
+    if len(variables) == 1:
+        selected = variables[0]
+
+        print('\nUsing Limine remembered-entry storage:')
+        print(describe_variable(selected))
+
+    else:
+        selected = choose(
+            'Your UEFI has more than one supported variable named '
+            'LimineLastBootedEntry. Please pick one:',
+            variables,
+            describe_variable,
+            footer=VARIABLE_EXPLANATION,
+        )
+    label = edit_label('Reboot into ' + entry['title'])
+    print('\nThe shortcut will select this entry and restart through your desktop session.')
+    if input(f'\nCreate shortcut “{label}”? [Y/n] ').strip().lower() not in ('', 'y', 'yes'):
+        return
+    data_home = Path(os.environ.get('XDG_DATA_HOME') or (Path.home() / '.local/share'))
+    if not data_home.is_absolute():
+        raise ValueError('XDG_DATA_HOME must be an absolute path.')
+    destination_dir = data_home / 'applications'
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    identifier = uuid.uuid4().hex
+    account = pwd.getpwuid(os.getuid())
+    command(['/usr/bin/sudo', APP, 'configure', '--id', identifier,
+             '--user', account.pw_name, '--config', menu['path'],
+             '--variable', selected['name'], '--entry', entry['path'], '--label', label])
+    destination = destination_dir / ('linksmine-' + identifier + '.desktop')
+    try:
+        atomic_file(destination, desktop_text(label, identifier).encode('utf-8'), 0o644)
+    except OSError as error:
+        raise ValueError(f'Could not save launcher: {error}. Remove saved authorization with linksmine remove {identifier}.') from error
+    print(f'\nCreated “{label}” in your application menu.')
+    print(f'To verify without restarting: linksmine select-test {identifier}')
+
+
+def resolve_id(identifier):
+    if identifier:
+        return valid_id(identifier)
+    shortcuts = user_shortcuts()
+    if len(shortcuts) == 1:
+        return shortcuts[0]['id']
+    if not shortcuts:
+        raise ValueError('No shortcuts configured. Run linksmine setup.')
+    if not sys.stdin.isatty():
+        raise ValueError('Several shortcuts exist. Specify an identifier from linksmine list.')
+    return choose('Select a shortcut:', shortcuts, lambda s: s['label'])['id']
+
+
+def remove_system(identifier):
+    with locked():
+        load_config(identifier)
+        # Called through normally authenticated sudo, never the NOPASSWD rule.
+        (Path('/etc/sudoers.d') / ('linksmine-' + identifier)).unlink(missing_ok=True)
+        config_path(identifier).unlink()
+    print('Removed shortcut authorization and configuration.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version='Linksmine ' + VERSION)
+    commands = parser.add_subparsers(dest='command', metavar='{setup,list,status,select-test,reboot,remove}')
+    wizard = commands.add_parser('setup', help='Create an application-menu shortcut')
+    wizard.add_argument('--config', help='Path to the Limine configuration')
+    commands.add_parser('list', help='List your configured shortcuts')
+    for name in ('status', 'select-test', 'reboot', 'remove'):
+        cmd = commands.add_parser(name, help={'status': 'Inspect a configured shortcut', 'select-test': 'Select an entry without restarting', 'reboot': 'Select an entry and restart through KDE', 'remove': 'Remove a shortcut and its authorization'}[name])
+        cmd.add_argument('id', nargs='?')
+    # Internal privileged operations are deliberately absent from NOPASSWD except select/status + a fixed ID.
+    probe = commands.add_parser('inspect')
+    probe.add_argument('--config')
+    config = commands.add_parser('configure')
+    for name in ('id', 'user', 'config', 'variable', 'entry', 'label'):
+        config.add_argument('--' + name, required=True)
+    select_parser = commands.add_parser('select')
+    select_parser.add_argument('id')
+    delete = commands.add_parser('remove-system')
+    delete.add_argument('id')
+    args = parser.parse_args()
+    if args.command is None or args.command == 'setup':
+        setup(getattr(args, 'config', None))
+    elif args.command == 'inspect':
+        print(json.dumps(inspect_system(args.config), ensure_ascii=False))
+    elif args.command == 'configure':
+        configure(args)
+    elif args.command == 'select':
+        select(valid_id(args.id))
+    elif args.command == 'remove-system':
+        remove_system(valid_id(args.id))
+    elif args.command == 'list':
+        for data in user_shortcuts():
+            print(f"{data['id']}  {data['label']} -> {data['entry']}")
+    elif args.command == 'status' and os.geteuid() == 0:
+        status(valid_id(args.id or ''))
+    else:
+        if os.geteuid() == 0:
+            raise ValueError('Run this command as your normal desktop user.')
+        identifier = resolve_id(args.id)
+        if args.command == 'status':
+            command(['/usr/bin/sudo', '-n', APP, 'status', identifier])
+        elif args.command == 'remove':
+            command(['/usr/bin/sudo', APP, 'remove-system', identifier])
+            home = Path(os.environ.get('XDG_DATA_HOME') or (Path.home() / '.local/share'))
+            (home / 'applications' / ('linksmine-' + identifier + '.desktop')).unlink(missing_ok=True)
+            print('Removed application-menu shortcut. Firmware was not changed.')
+        else:
+            if args.command == 'reboot':
+                require_kde()
+            command(['/usr/bin/sudo', '-n', APP, 'select', identifier])
+            if args.command == 'select-test':
+                print('Selection verified. No restart requested.')
+            else:
+                subprocess.run(['/usr/bin/busctl', '--user', 'call', 'org.kde.Shutdown',
+                                '/Shutdown', 'org.kde.Shutdown', 'logoutAndReboot'], check=True)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print('\nCancelled.', file=sys.stderr)
+        sys.exit(130)
+    except Exception as error:
+        message = str(error)
+        print('linksmine:', message, file=sys.stderr)
+        if len(sys.argv) > 1 and sys.argv[1] == 'reboot' and os.geteuid() != 0:
+            try:
+                subprocess.run(['/usr/bin/kdialog', '--error', message], check=False)
+            except OSError:
+                pass
+        sys.exit(1)

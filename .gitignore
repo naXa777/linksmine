@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.idea/
+.venv/
+/src/
+/pkg/
+*.pkg.tar.*
+*.tar.gz
+*.tar.zst

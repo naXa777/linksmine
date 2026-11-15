@@ -1,0 +1,29 @@
+# Maintainer: Pavel <https://github.com/naXa777>
+pkgname=linksmine-git
+pkgver=0.2.0.r0
+pkgrel=1
+pkgdesc='CLI setup wizard for Limine boot-entry restart shortcuts (Git version)'
+arch=('x86_64')
+url='https://github.com/naXa777/linksmine'
+license=('MIT')
+depends=('python' 'sudo' 'systemd' 'e2fsprogs' 'kdialog')
+makedepends=('git' 'make')
+provides=('linksmine')
+conflicts=('linksmine')
+source=('linksmine::git+https://github.com/naXa777/linksmine.git')
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/linksmine"
+    local version
+    version=$(sed -n "s/^VERSION = '\([^']*\)'/\1/p" linksmine)
+    printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+check() {
+    make -C "$srcdir/linksmine" test
+}
+
+package() {
+    make -C "$srcdir/linksmine" DESTDIR="$pkgdir" install
+}
