@@ -60,6 +60,28 @@ linksmine setup --config /path/to/limine.conf
 
 When several configurations or remembered-entry variables exist, setup asks which to use. Only the selected variable is changed. Check the selected entry in Limine on the first restart.
 
+### Demo
+
+You should now see a new shortcut
+
+![Reboot into Windows shortcut](img/demo.jpg)
+
+### Customize the shortcut
+
+You can change the default icon using KDE Menu Editor:
+
+1. Right-click the generated shortcut and choose **Edit Application…**.
+2. Open the icon chooser.
+3. Search for an appropriate icon.
+4. Click **Save**.
+
+Available icons depend on your installed icon theme.
+For example, look here https://dashboardicons.com/icons?q=windows.
+
+![icon chooser](img/customize.png)
+
+Leave the program and command-line arguments unchanged.
+
 ## Commands
 
 ```sh
