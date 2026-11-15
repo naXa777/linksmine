@@ -1,7 +1,7 @@
 PREFIX ?= /usr
 DESTDIR ?=
 
-.PHONY: install test
+.PHONY: install test refresh
 
 install:
 	install -Dm755 linksmine "$(DESTDIR)$(PREFIX)/bin/linksmine"
@@ -10,3 +10,6 @@ install:
 
 test:
 	python -m unittest -v test_core
+
+refresh:
+	./scripts/update-package

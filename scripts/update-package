@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+    pwd
+)"
+cd -- "$project_root"
+
+if (( EUID == 0 )); then
+    printf 'Run this script as your normal user, not with sudo.\n' >&2
+    exit 1
+fi
+
+for tool in make makepkg updpkgsums; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'Required command not found: %s\n' "$tool" >&2
+
+        if [[ "$tool" == updpkgsums ]]; then
+            printf 'Install it with: sudo pacman -S --needed pacman-contrib\n' >&2
+        fi
+
+        exit 1
+    fi
+done
+
+if [[ ! -f PKGBUILD ]]; then
+    printf 'PKGBUILD not found in %s\n' "$project_root" >&2
+    exit 1
+fi
+
+printf '\n==> Running tests\n'
+make test
+
+printf '\n==> Updating PKGBUILD checksums\n'
+updpkgsums
+
+printf '\n==> Generating .SRCINFO\n'
+temporary="$(mktemp "$project_root/.SRCINFO.XXXXXX")"
+trap 'rm -f -- "$temporary"' EXIT
+
+makepkg --printsrcinfo > "$temporary"
+
+if [[ ! -s "$temporary" ]]; then
+    printf 'Generated .SRCINFO is empty; keeping the existing file.\n' >&2
+    exit 1
+fi
+
+chmod 644 "$temporary"
+mv -f -- "$temporary" "$project_root/.SRCINFO"
+trap - EXIT
+
+printf '\n==> Package metadata updated successfully\n'
+printf 'Review: git diff -- PKGBUILD .SRCINFO\n'
+printf 'Build:  makepkg -Cfsi\n'
